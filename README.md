@@ -21,10 +21,27 @@ the movement, and recommends a weight based on your history.
   - *Skip — different body part*: move on
   - *Equipment busy — try again later*: deferred and re-offered later in the session
 - **Weight suggestions** — repeats your last weight, and nudges it up
-  (+2.5 kg, +2 kg for dumbbells/kettlebells) when you hit all your targets last time.
+  (+2.5 kg, +2 kg for dumbbells/kettlebells) when you hit all your targets last
+  time. Warm-up sets are flagged and excluded from the math.
+- **PRs and bests** — a 🏆 banner the moment you beat your heaviest weight or
+  best rep count, and every exercise shows its all-time best weight (with reps)
+  and best reps (with weight).
+- **Progress charts** — per-exercise top-weight chart over time, plus full
+  session-by-session history.
+- **Supersets** — link adjacent template exercises and log them alternately in
+  one combined view.
+- **In-session search** — pull up any exercise mid-session instead of taking
+  the suggestion.
+- **Notes** — per-exercise notes ("seat position 4") that resurface next time
+  you do that exercise, plus a per-session note.
+- **Save a session as a workout** — turn a good improvised session into a
+  reusable template with one tap from history.
 - **Demos** — every exercise shows an animated two-frame demonstration and
   step-by-step instructions, served locally (fine on hotel Wi-Fi over a VPN).
 - **Favorites** — star exercises you like and they'll come up more often.
+- **Offline-tolerant** — a service worker caches the app shell and demo images,
+  and sets logged while the connection is down are queued and synced when it
+  returns.
 - **Multiple profiles** — a simple name picker, no passwords. Intended to run on
   a private network (e.g. behind [Tailscale](https://tailscale.com)); it has no
   authentication of its own — **do not expose it to the open internet**.

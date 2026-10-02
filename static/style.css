@@ -228,6 +228,40 @@ details ol { padding-left: 20px; font-size: 14px; line-height: 1.6; color: #c2cd
 }
 .pcircle .avatar { width: 62px; height: 62px; font-size: 24px; border: 2px solid rgba(255,255,255,.12); }
 
+/* ---------- set markers, PRs, supersets ---------- */
+.mark {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 20px; height: 20px; border-radius: 6px; padding: 0 4px;
+  font-size: 11px; font-weight: 800; margin-left: 6px;
+}
+.mark.w { background: #223042; color: #8fb4d9; }
+.mark.f { background: #3a2a14; color: var(--warn); }
+.mark.pr { background: #3a2f10; color: #ffd24a; }
+.mark.q { background: #2a2a33; color: #aab; }
+.pr-banner {
+  background: linear-gradient(135deg, rgba(255,210,74,.16), rgba(255,160,36,.08));
+  border: 1px solid rgba(255,210,74,.35); color: #ffd24a;
+  border-radius: var(--radius-sm); padding: 10px 14px; font-weight: 700;
+  margin-bottom: 12px; text-align: center; animation: rise .3s ease;
+}
+button.chip.mini { padding: 7px 12px; font-size: 13px; margin-bottom: 0; }
+.ab {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; border-radius: 7px; flex: none; margin-right: 8px;
+  font-size: 12px; font-weight: 800;
+}
+.ab.a { background: rgba(61,220,132,.16); color: var(--accent); }
+.ab.b { background: rgba(116,192,252,.16); color: #74c0fc; }
+.sup-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-weight: 600; }
+.sup-row.off { opacity: .45; font-weight: 500; }
+.bestline { color: var(--dim); font-size: 13.5px; margin: 8px 0 0; }
+.bestline strong { color: var(--text); }
+.noteline { color: #d9c88a; font-size: 13.5px; margin: 8px 0 0; }
+
+/* ---------- progress chart ---------- */
+.chartbox { padding: 6px 2px 0; }
+.chartbox svg { width: 100%; height: auto; display: block; }
+
 /* ---------- misc ---------- */
 .muted-strike { color: var(--dim); text-decoration: line-through; }
 .done-hero { text-align: center; padding: 34px 16px; }

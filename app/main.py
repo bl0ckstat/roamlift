@@ -112,19 +112,20 @@ CREATE TABLE IF NOT EXISTS templates(
 CREATE TABLE IF NOT EXISTS template_items(
   id INTEGER PRIMARY KEY, template_id INTEGER NOT NULL REFERENCES templates(id) ON DELETE CASCADE,
   position INTEGER NOT NULL, exercise_id TEXT NOT NULL,
-  target_sets INTEGER NOT NULL DEFAULT 3, target_reps INTEGER NOT NULL DEFAULT 8);
+  target_sets INTEGER NOT NULL DEFAULT 3, target_reps INTEGER NOT NULL DEFAULT 8,
+  superset_with_next INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS sessions(
   id INTEGER PRIMARY KEY, profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   gym_id INTEGER REFERENCES gyms(id) ON DELETE SET NULL,
   mode TEXT NOT NULL, template_id INTEGER REFERENCES templates(id) ON DELETE SET NULL,
-  focus TEXT, current_part TEXT,
+  focus TEXT, current_part TEXT, note TEXT,
   started_at TEXT NOT NULL, finished_at TEXT);
 CREATE TABLE IF NOT EXISTS session_exercises(
   id INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
   exercise_id TEXT NOT NULL, position INTEGER NOT NULL,
   target_sets INTEGER NOT NULL DEFAULT 3, target_reps INTEGER NOT NULL DEFAULT 8,
-  status TEXT NOT NULL, -- active | done | skipped
-  body_part TEXT, template_item_id INTEGER);
+  status TEXT NOT NULL, -- active | done | skipped | deferred
+  body_part TEXT, template_item_id INTEGER, note TEXT);
 CREATE TABLE IF NOT EXISTS favorites(
   profile_id INTEGER NOT NULL REFERENCES profiles(id) ON DELETE CASCADE,
   exercise_id TEXT NOT NULL,
@@ -133,11 +134,26 @@ CREATE TABLE IF NOT EXISTS sets(
   id INTEGER PRIMARY KEY,
   session_exercise_id INTEGER NOT NULL REFERENCES session_exercises(id) ON DELETE CASCADE,
   set_number INTEGER NOT NULL, weight_kg REAL NOT NULL, reps INTEGER NOT NULL,
+  is_warmup INTEGER NOT NULL DEFAULT 0, to_failure INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL);
 """
 
+# Column additions for databases created before these features existed.
+MIGRATIONS = [
+    "ALTER TABLE sets ADD COLUMN is_warmup INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE sets ADD COLUMN to_failure INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE session_exercises ADD COLUMN note TEXT",
+    "ALTER TABLE sessions ADD COLUMN note TEXT",
+    "ALTER TABLE template_items ADD COLUMN superset_with_next INTEGER NOT NULL DEFAULT 0",
+]
+
 with db() as conn:
     conn.executescript(SCHEMA)
+    for mig in MIGRATIONS:
+        try:
+            conn.execute(mig)
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 # ---------------------------------------------------------------- app
 
@@ -154,6 +170,11 @@ def index():
 @app.get("/manifest.json")
 def manifest():
     return FileResponse(ROOT / "static" / "manifest.json")
+
+
+@app.get("/sw.js")
+def service_worker():
+    return FileResponse(ROOT / "static" / "sw.js", media_type="application/javascript")
 
 # ----- reference data
 
@@ -259,6 +280,7 @@ class TemplateItemIn(BaseModel):
     exercise_id: str
     target_sets: int = 3
     target_reps: int = 8
+    superset_with_next: bool = False
 
 
 class TemplateIn(BaseModel):
@@ -280,6 +302,7 @@ def template_out(conn, row) -> dict:
             "bodyPart": ex["bodyPart"] if ex else None,
             "target_sets": it["target_sets"],
             "target_reps": it["target_reps"],
+            "superset_with_next": bool(it["superset_with_next"]),
         })
     return {"id": row["id"], "name": row["name"], "profile_id": row["profile_id"], "items": items}
 
@@ -299,9 +322,10 @@ def write_template_items(conn, template_id: int, items: list[TemplateItemIn]):
         if it.exercise_id not in EXERCISES:
             raise HTTPException(400, f"unknown exercise {it.exercise_id}")
         conn.execute(
-            "INSERT INTO template_items(template_id, position, exercise_id, target_sets, target_reps)"
-            " VALUES(?,?,?,?,?)",
-            (template_id, i, it.exercise_id, it.target_sets, it.target_reps),
+            "INSERT INTO template_items(template_id, position, exercise_id, target_sets,"
+            " target_reps, superset_with_next) VALUES(?,?,?,?,?,?)",
+            (template_id, i, it.exercise_id, it.target_sets, it.target_reps,
+             int(it.superset_with_next)),
         )
 
 
@@ -368,22 +392,46 @@ def toggle_favorite(f: FavoriteIn):
 
 # ----- weight suggestion
 
+def best_stats(conn, profile_id: int, exercise_id: str) -> Optional[dict]:
+    """All-time bests over working (non-warm-up) sets: heaviest weight with the
+    reps achieved at it, and the highest rep count with the weight it was at."""
+    rows = conn.execute(
+        """SELECT st.weight_kg w, st.reps r FROM sets st
+           JOIN session_exercises se ON se.id = st.session_exercise_id
+           JOIN sessions s ON s.id = se.session_id
+           WHERE s.profile_id=? AND se.exercise_id=? AND st.is_warmup=0""",
+        (profile_id, exercise_id),
+    ).fetchall()
+    if not rows:
+        return None
+    top_w = max(rows, key=lambda x: (x["w"], x["r"]))
+    top_r = max(rows, key=lambda x: (x["r"], x["w"]))
+    return {
+        "top_weight": {"weight_kg": top_w["w"], "reps": top_w["r"]},
+        "top_reps": {"reps": top_r["r"], "weight_kg": top_r["w"]},
+    }
+
+
 def suggest_weight(conn, profile_id: int, exercise_id: str) -> dict:
-    """Last weight used, nudged up if every target was hit last time."""
+    """Last weight used, nudged up if every target was hit last time.
+    Warm-up sets are ignored throughout."""
     ex = EXERCISES[exercise_id]
     bodyweight = ex["equipment"] in ALWAYS_AVAILABLE
+    best = best_stats(conn, profile_id, exercise_id)
     row = conn.execute(
-        """SELECT se.id, se.target_sets, se.target_reps, s.started_at
+        """SELECT se.id, se.target_sets, se.target_reps, se.note, s.started_at
            FROM session_exercises se JOIN sessions s ON s.id = se.session_id
            WHERE s.profile_id=? AND se.exercise_id=? AND se.status='done'
-             AND EXISTS (SELECT 1 FROM sets WHERE session_exercise_id = se.id)
+             AND EXISTS (SELECT 1 FROM sets
+                         WHERE session_exercise_id = se.id AND is_warmup=0)
            ORDER BY s.started_at DESC, se.id DESC LIMIT 1""",
         (profile_id, exercise_id),
     ).fetchone()
     if not row:
-        return {"suggested_weight": None, "bodyweight": bodyweight, "last": None}
+        return {"suggested_weight": None, "bodyweight": bodyweight, "last": None, "best": best}
     sets = conn.execute(
-        "SELECT weight_kg, reps FROM sets WHERE session_exercise_id=? ORDER BY set_number",
+        "SELECT weight_kg, reps FROM sets WHERE session_exercise_id=? AND is_warmup=0"
+        " ORDER BY set_number",
         (row["id"],),
     ).fetchall()
     top = max(s["weight_kg"] for s in sets)
@@ -397,7 +445,9 @@ def suggest_weight(conn, profile_id: int, exercise_id: str) -> dict:
             "date": row["started_at"][:10],
             "sets": [{"weight_kg": s["weight_kg"], "reps": s["reps"]} for s in sets],
             "progressed": hit_all,
+            "note": row["note"],
         },
+        "best": best,
     }
 
 # ----- sessions
@@ -428,6 +478,12 @@ class AcceptIn(BaseModel):
 class SetIn(BaseModel):
     weight_kg: float
     reps: int
+    is_warmup: bool = False
+    to_failure: bool = False
+
+
+class NoteIn(BaseModel):
+    note: str
 
 
 def gym_equipment_set(conn, gym_id: Optional[int]) -> set:
@@ -590,7 +646,7 @@ def build_suggestion(conn, sess) -> dict:
             return {"done": True}
         ex = EXERCISES.get(item["exercise_id"])
         sug = suggest_weight(conn, sess["profile_id"], ex["id"])
-        return {
+        out = {
             "done": False,
             "exercise": public_exercise(ex),
             "favorite": is_favorite(conn, sess["profile_id"], ex["id"]),
@@ -599,6 +655,24 @@ def build_suggestion(conn, sess) -> dict:
             "target_reps": item["target_reps"],
             **sug,
         }
+        if item["superset_with_next"]:
+            partner = conn.execute(
+                """SELECT * FROM template_items WHERE template_id=? AND position=?
+                   AND id NOT IN (SELECT template_item_id FROM session_exercises
+                                  WHERE session_id=? AND template_item_id IS NOT NULL)""",
+                (sess["template_id"], item["position"] + 1, session_id),
+            ).fetchone()
+            if partner and partner["exercise_id"] in EXERCISES:
+                pex = EXERCISES[partner["exercise_id"]]
+                out["superset_next"] = {
+                    "exercise": public_exercise(pex),
+                    "favorite": is_favorite(conn, sess["profile_id"], pex["id"]),
+                    "template_item_id": partner["id"],
+                    "target_sets": partner["target_sets"],
+                    "target_reps": partner["target_reps"],
+                    **suggest_weight(conn, sess["profile_id"], pex["id"]),
+                }
+        return out
     # free mode
     part = sess["current_part"] or next_part(sess, parts_done_count(conn, session_id), None, False)
     # Re-offer a deferred (equipment was busy) exercise for this part once at
@@ -787,12 +861,30 @@ def log_set(se_id: int, body: SetIn):
             "SELECT COALESCE(MAX(set_number),0)+1 n FROM sets WHERE session_exercise_id=?",
             (se_id,),
         ).fetchone()["n"]
+        # PR detection against all prior working sets for this exercise.
+        pr_weight = pr_reps = False
+        if not body.is_warmup:
+            profile_id = conn.execute(
+                "SELECT profile_id FROM sessions WHERE id=?", (se["session_id"],)
+            ).fetchone()["profile_id"]
+            hist = conn.execute(
+                """SELECT st.weight_kg w, st.reps r FROM sets st
+                   JOIN session_exercises se2 ON se2.id = st.session_exercise_id
+                   JOIN sessions s ON s.id = se2.session_id
+                   WHERE s.profile_id=? AND se2.exercise_id=? AND st.is_warmup=0""",
+                (profile_id, se["exercise_id"]),
+            ).fetchall()
+            if hist:
+                pr_weight = body.weight_kg > max(h["w"] for h in hist)
+                at_weight = [h["r"] for h in hist if h["w"] >= body.weight_kg]
+                pr_reps = bool(at_weight) and body.reps > max(at_weight)
         conn.execute(
-            "INSERT INTO sets(session_exercise_id, set_number, weight_kg, reps, created_at)"
-            " VALUES(?,?,?,?,?)",
-            (se_id, n, body.weight_kg, body.reps, now()),
+            "INSERT INTO sets(session_exercise_id, set_number, weight_kg, reps,"
+            " is_warmup, to_failure, created_at) VALUES(?,?,?,?,?,?,?)",
+            (se_id, n, body.weight_kg, body.reps,
+             int(body.is_warmup), int(body.to_failure), now()),
         )
-        return {"set_number": n}
+        return {"set_number": n, "pr_weight": pr_weight, "pr_reps": pr_reps}
 
 
 @app.post("/api/session_exercises/{se_id}/finish")
@@ -802,7 +894,7 @@ def finish_exercise(se_id: int):
         if not se:
             raise HTTPException(404, "not found")
         has_sets = conn.execute(
-            "SELECT COUNT(*) c FROM sets WHERE session_exercise_id=?", (se_id,)
+            "SELECT COUNT(*) c FROM sets WHERE session_exercise_id=? AND is_warmup=0", (se_id,)
         ).fetchone()["c"]
         conn.execute(
             "UPDATE session_exercises SET status=? WHERE id=?",
@@ -846,6 +938,101 @@ def delete_session(session_id: int):
         conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
     return {"ok": True}
 
+# ----- notes
+
+@app.put("/api/session_exercises/{se_id}/note")
+def set_exercise_note(se_id: int, body: NoteIn):
+    with db() as conn:
+        cur = conn.execute(
+            "UPDATE session_exercises SET note=? WHERE id=?", (body.note.strip() or None, se_id)
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(404, "not found")
+    return {"ok": True}
+
+
+@app.put("/api/sessions/{session_id}/note")
+def set_session_note(session_id: int, body: NoteIn):
+    with db() as conn:
+        session_row(conn, session_id)
+        conn.execute(
+            "UPDATE sessions SET note=? WHERE id=?", (body.note.strip() or None, session_id)
+        )
+    return {"ok": True}
+
+# ----- save a finished session as a reusable workout
+
+class SaveTemplateIn(BaseModel):
+    name: str
+
+
+@app.post("/api/sessions/{session_id}/save_template")
+def save_session_as_template(session_id: int, body: SaveTemplateIn):
+    with db() as conn:
+        sess = session_row(conn, session_id)
+        rows = conn.execute(
+            "SELECT * FROM session_exercises WHERE session_id=? AND status='done'"
+            " ORDER BY position",
+            (session_id,),
+        ).fetchall()
+        if not rows:
+            raise HTTPException(400, "session has no completed exercises")
+        cur = conn.execute(
+            "INSERT INTO templates(profile_id, name) VALUES(?,?)",
+            (sess["profile_id"], body.name.strip() or "Saved session"),
+        )
+        template_id = cur.lastrowid
+        for i, se in enumerate(rows):
+            work = conn.execute(
+                "SELECT reps, COUNT(*) c FROM sets WHERE session_exercise_id=? AND is_warmup=0"
+                " GROUP BY reps ORDER BY c DESC, reps DESC LIMIT 1",
+                (se["id"],),
+            ).fetchone()
+            n_sets = conn.execute(
+                "SELECT COUNT(*) c FROM sets WHERE session_exercise_id=? AND is_warmup=0",
+                (se["id"],),
+            ).fetchone()["c"]
+            conn.execute(
+                "INSERT INTO template_items(template_id, position, exercise_id, target_sets,"
+                " target_reps, superset_with_next) VALUES(?,?,?,?,?,0)",
+                (template_id, i, se["exercise_id"],
+                 n_sets or se["target_sets"],
+                 work["reps"] if work else se["target_reps"]),
+            )
+        return {"id": template_id}
+
+# ----- progress
+
+@app.get("/api/progress")
+def progress(profile_id: int):
+    """Exercises with history, most recently trained first."""
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT se.exercise_id, MAX(s.started_at) last_date,
+                      COUNT(DISTINCT se.id) n, MAX(st.weight_kg) top_w
+               FROM session_exercises se
+               JOIN sessions s ON s.id = se.session_id
+               JOIN sets st ON st.session_exercise_id = se.id AND st.is_warmup=0
+               WHERE s.profile_id=? AND se.status='done'
+               GROUP BY se.exercise_id ORDER BY last_date DESC""",
+            (profile_id,),
+        ).fetchall()
+    out = []
+    for r in rows:
+        ex = EXERCISES.get(r["exercise_id"])
+        if not ex:
+            continue
+        out.append({
+            "exercise_id": r["exercise_id"],
+            "name": ex["name"],
+            "bodyPart": ex["bodyPart"],
+            "equipment": ex["equipment"],
+            "last_date": r["last_date"][:10],
+            "sessions": r["n"],
+            "top_weight": r["top_w"],
+        })
+    return out
+
 # ----- history
 
 def session_detail(conn, sess) -> dict:
@@ -859,7 +1046,8 @@ def session_detail(conn, sess) -> dict:
     ):
         ex = EXERCISES.get(se["exercise_id"])
         sets = [
-            {"weight_kg": r["weight_kg"], "reps": r["reps"]}
+            {"weight_kg": r["weight_kg"], "reps": r["reps"],
+             "is_warmup": bool(r["is_warmup"]), "to_failure": bool(r["to_failure"])}
             for r in conn.execute(
                 "SELECT * FROM sets WHERE session_exercise_id=? ORDER BY set_number", (se["id"],)
             )
@@ -873,12 +1061,13 @@ def session_detail(conn, sess) -> dict:
             "target_sets": se["target_sets"],
             "target_reps": se["target_reps"],
             "template_item_id": se["template_item_id"],
+            "note": se["note"],
             "sets": sets,
         })
     return {
         "id": sess["id"], "mode": sess["mode"], "focus": sess["focus"], "gym": gym,
         "started_at": sess["started_at"], "finished_at": sess["finished_at"],
-        "exercises": exercises,
+        "note": sess["note"], "exercises": exercises,
     }
 
 
@@ -899,17 +1088,20 @@ def exercise_history(exercise_id: str, profile_id: int):
             """SELECT se.id, s.started_at FROM session_exercises se
                JOIN sessions s ON s.id=se.session_id
                WHERE s.profile_id=? AND se.exercise_id=? AND se.status='done'
-               ORDER BY s.started_at DESC LIMIT 20""",
+               ORDER BY s.started_at DESC LIMIT 40""",
             (profile_id, exercise_id),
         ).fetchall()
         out = []
         for r in rows:
             sets = conn.execute(
-                "SELECT weight_kg, reps FROM sets WHERE session_exercise_id=? ORDER BY set_number",
+                "SELECT weight_kg, reps, is_warmup, to_failure FROM sets"
+                " WHERE session_exercise_id=? ORDER BY set_number",
                 (r["id"],),
             ).fetchall()
             out.append({
                 "date": r["started_at"][:10],
-                "sets": [{"weight_kg": s["weight_kg"], "reps": s["reps"]} for s in sets],
+                "sets": [{"weight_kg": x["weight_kg"], "reps": x["reps"],
+                          "is_warmup": bool(x["is_warmup"]), "to_failure": bool(x["to_failure"])}
+                         for x in sets],
             })
         return out

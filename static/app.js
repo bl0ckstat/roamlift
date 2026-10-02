@@ -41,8 +41,11 @@ const EQ_ICONS = {
 };
 const ICONS = {
   flash: svg(`<path d="M13 2.5 4.5 13.5h6l-1 8L18 10.5h-6l1-8z" fill="currentColor" stroke="none"/>`),
+  chart: svg(`<path d="M3.5 20.5h17"/><path d="M5 16.5l4.4-5 3.6 2.8 5.6-7"/><circle cx="5" cy="16.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="9.4" cy="11.5" r="1.4" fill="currentColor" stroke="none"/><circle cx="13" cy="14.3" r="1.4" fill="currentColor" stroke="none"/><circle cx="18.6" cy="7.3" r="1.4" fill="currentColor" stroke="none"/>`),
+  link: svg(`<path d="M9.5 14.5 14.5 9.5"/><path d="M11 6.5 12.8 4.7a3.8 3.8 0 0 1 5.4 5.4L16.4 12"/><path d="M13 17.5l-1.8 1.8a3.8 3.8 0 0 1-5.4-5.4L7.6 12"/>`),
   list: svg(`<line x1="9" y1="6" x2="20" y2="6"/><line x1="9" y1="12" x2="20" y2="12"/><line x1="9" y1="18" x2="20" y2="18"/><circle cx="4.6" cy="6" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.6" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="4.6" cy="18" r="1.3" fill="currentColor" stroke="none"/>`),
   pin: svg(`<path d="M12 21s7-6.1 7-11a7 7 0 1 0-14 0c0 4.9 7 11 7 11z"/><circle cx="12" cy="10" r="2.6"/>`),
+  search: svg(`<circle cx="10.5" cy="10.5" r="6.5"/><line x1="15.3" y1="15.3" x2="21" y2="21"/>`),
   clock: svg(`<circle cx="12" cy="12" r="8.4"/><path d="M12 7.4V12l3.2 2"/>`),
 };
 
@@ -78,7 +81,13 @@ async function api(path, opts = {}) {
     opts.body = JSON.stringify(opts.body);
     opts.method = opts.method || "POST";
   }
-  const r = await fetch("/api" + path, opts);
+  let r;
+  try {
+    r = await fetch("/api" + path, opts);
+  } catch (e) {
+    e.network = true;  // offline / server unreachable
+    throw e;
+  }
   if (!r.ok) {
     let msg = r.statusText;
     try { msg = (await r.json()).detail || msg; } catch {}
@@ -86,6 +95,23 @@ async function api(path, opts = {}) {
   }
   return r.json();
 }
+
+/* ---- offline queue for logged sets (the one write that must not be lost) ---- */
+
+function setQueue() { return JSON.parse(localStorage.getItem("setQueue") || "[]"); }
+function saveSetQueue(q) { localStorage.setItem("setQueue", JSON.stringify(q)); }
+
+async function flushSetQueue() {
+  let q = setQueue();
+  while (q.length) {
+    try {
+      await api(`/session_exercises/${q[0].seId}/sets`, { body: q[0].body });
+      q.shift(); saveSetQueue(q);
+    } catch { break; }
+  }
+  return q.length === 0;
+}
+window.addEventListener("online", flushSetQueue);
 
 function setHeader(html) { headerRight.innerHTML = html || ""; }
 
@@ -121,6 +147,8 @@ async function go(where, arg) {
   if (where === "template-setup") return renderTemplateSetup();
   if (where === "session") return renderSession();
   if (where === "history") return renderHistory();
+  if (where === "progress") return renderProgress();
+  if (where === "exercise-detail") return renderExerciseDetail(arg);
 }
 
 /* ------------------------------------------------ profiles */
@@ -157,7 +185,7 @@ async function createProfile() {
 /* ------------------------------------------------ home */
 
 async function renderHome() {
-  S.session = null; S.se = null; S.suggestion = null;
+  S.session = null; S.se = null; S.sup = null; S.suggestion = null;
   const resumeId = localStorage.getItem("activeSession");
   let resumeHtml = "";
   if (resumeId) {
@@ -190,6 +218,9 @@ async function renderHome() {
     </button>
     <button class="action" onclick="go('gyms')">
       <span class="ic">${ICONS.pin}</span><span>Gyms &amp; equipment</span><span class="chev">›</span>
+    </button>
+    <button class="action" onclick="go('progress')">
+      <span class="ic">${ICONS.chart}</span><span>Progress</span><span class="chev">›</span>
     </button>
     <button class="action" onclick="go('history')">
       <span class="ic">${ICONS.clock}</span><span>History</span><span class="chev">›</span>
@@ -314,6 +345,9 @@ function renderEditorItems() {
           <span class="dim">Reps</span>
           <input type="number" min="1" value="${it.target_reps}" onchange="editorItems[${i}].target_reps=+this.value">
         </div>
+        ${i < editorItems.length - 1 ? `
+        <button class="chip mini ${it.superset_with_next ? "sel" : ""}" style="margin-top:10px"
+          onclick="editorItems[${i}].superset_with_next=!editorItems[${i}].superset_with_next;renderEditorItems()">⛓ superset with next</button>` : ""}
       </div>`).join("");
 }
 
@@ -355,7 +389,10 @@ async function saveTemplate(templateId) {
   if (!name || editorItems.length === 0) { alert("Name and at least one exercise required"); return; }
   const body = {
     profile_id: S.profile.id, name,
-    items: editorItems.map(i => ({ exercise_id: i.exercise_id, target_sets: i.target_sets, target_reps: i.target_reps })),
+    items: editorItems.map((i, idx) => ({
+      exercise_id: i.exercise_id, target_sets: i.target_sets, target_reps: i.target_reps,
+      superset_with_next: idx < editorItems.length - 1 && !!i.superset_with_next,
+    })),
   };
   if (templateId) await api(`/templates/${templateId}`, { method: "PUT", body });
   else await api("/templates", { body });
@@ -448,18 +485,29 @@ async function startTemplateSession() {
 async function resumeSession(id) {
   const sess = await api(`/sessions/${id}`);
   S.session = { id: sess.id, mode: sess.mode, done: sess.exercises.filter(e => e.status === "done").length };
-  const active = sess.exercises.find(e => e.status === "active");
-  if (active) {
-    const ex = await api(`/exercises/${active.exercise_id}`);
-    S.se = {
-      id: active.id, exercise: ex,
-      target_sets: active.target_sets, target_reps: active.target_reps,
-      sets: active.sets, suggested: null,
-    };
+  const actives = sess.exercises.filter(e => e.status === "active");
+  wuOn = false; tfOn = false;
+  if (actives.length) {
+    const items = await Promise.all(actives.slice(0, 2).map(async (a) => {
+      const ex = await api(`/exercises/${a.exercise_id}`);
+      return {
+        id: a.id, exercise: ex,
+        target_sets: a.target_sets, target_reps: a.target_reps,
+        sets: a.sets, suggested: null, bodyweight: false,
+        last: null, best: null, favorite: false,
+        note: a.note || "", lastPr: null,
+      };
+    }));
+    if (items.length >= 2) {
+      S.sup = { items, turn: items[0].sets.length <= items[1].sets.length ? 0 : 1 };
+      S.se = null;
+    } else {
+      S.se = items[0]; S.sup = null;
+    }
     S.suggestion = null;
   } else {
     S.suggestion = sess.suggestion;
-    S.se = null;
+    S.se = null; S.sup = null;
   }
   go("session");
 }
@@ -475,6 +523,7 @@ function sessionHeader() {
 
 async function renderSession() {
   sessionHeader();
+  if (S.sup) return renderSupersetLogging();
   if (S.se) return renderLogging();
   const sg = S.suggestion;
   if (!sg || sg.done) {
@@ -484,13 +533,13 @@ async function renderSession() {
         <p style="font-size:19px;font-weight:800">${sg && sg.reason ? esc(sg.reason) : "Workout complete!"}</p>
         <p class="dim">${S.session.done} exercise${S.session.done === 1 ? "" : "s"} done</p>
       </div>
+      <input type="text" id="sess-note" placeholder="Session note (optional)">
       <button class="primary" onclick="finishSession()">Finish &amp; save session</button>
-      <button class="ghost" onclick="renderSessionSearch()">🔍 Add one more — search exercises</button>`);
+      <button class="ghost" onclick="renderSessionSearch()"><span class="eqicon" style="vertical-align:-3px;margin-right:6px">${ICONS.search}</span>Add one more — search exercises</button>`);
     return;
   }
   const ex = sg.exercise;
-  const lastHtml = sg.last ? `
-    <p class="dim" style="margin:10px 0 0">Last time (${sg.last.date}): ${sg.last.sets.map(s => `${s.weight_kg}×${s.reps}`).join(", ")}</p>` : "";
+  const sup = sg.superset_next;
   render(`
     ${sg.retry ? `<div class="hint">↩ Back to this one — equipment free now?</div>` : ""}
     ${sg.substitute ? `<div class="hint">Substitute for the same body part</div>` : ""}
@@ -503,17 +552,36 @@ async function renderSession() {
       <details><summary>How to do it</summary>
         <ol>${ex.instructions.map(i => `<li>${esc(i)}</li>`).join("")}</ol>
       </details>
-      ${lastHtml}
+      ${lastLine(sg)}${bestLine(sg.best)}${noteLine(sg.last)}
       <p class="dim" style="margin:8px 0 0">Target: <strong style="color:var(--text)">${sg.target_sets} × ${sg.target_reps}</strong>${sg.suggested_weight != null ? ` · suggested <strong style="color:var(--accent)">${sg.suggested_weight} kg</strong>` : ""}</p>
     </div>
-    <button class="primary" onclick="acceptSuggestion()">✓ Do this</button>
+    ${sup ? `
+    <div class="card" style="padding:12px 16px">
+      <div class="sup-row"><span class="eqicon" style="color:var(--accent)">${ICONS.link}</span>
+        <span>Superset with <strong>${esc(sup.exercise.name)}</strong></span></div>
+      <div>${partBadge(sup.exercise.bodyPart)}${eqBadge(sup.exercise.equipment)}
+        <span class="badge">${sup.target_sets} × ${sup.target_reps}${sup.suggested_weight != null ? ` · ${sup.suggested_weight} kg` : ""}</span></div>
+    </div>` : ""}
+    <button class="primary" onclick="acceptSuggestion()">✓ ${sup ? "Do superset" : "Do this"}</button>
     <div class="skiprow">
       <button onclick="skip('same')">Skip<span class="dim" style="display:block;font-size:12px;font-weight:500">same body part</span></button>
       <button onclick="skip('different')">Skip<span class="dim" style="display:block;font-size:12px;font-weight:500">${S.session.mode === "template" ? "this exercise" : "different body part"}</span></button>
     </div>
     <button class="warn" style="text-align:center" onclick="skip('later')"><span class="eqicon" style="vertical-align:-3px;margin-right:6px">${ICONS.clock}</span>Equipment busy — try again later</button>
-    <button class="ghost" onclick="renderSessionSearch()">🔍 ${S.session.mode === "template" ? "Swap in a different exercise" : "Search for an exercise instead"}</button>`);
+    <button class="ghost" onclick="renderSessionSearch()"><span class="eqicon" style="vertical-align:-3px;margin-right:6px">${ICONS.search}</span>${S.session.mode === "template" ? "Swap in a different exercise" : "Search for an exercise instead"}</button>`);
   startDemo(ex.images);
+}
+
+function lastLine(src) {
+  return src.last ? `<p class="dim" style="margin:10px 0 0">Last time (${src.last.date}): ${src.last.sets.map(s => `${s.weight_kg}×${s.reps}`).join(", ")}</p>` : "";
+}
+function bestLine(best) {
+  if (!best) return "";
+  const w = best.top_weight, r = best.top_reps;
+  return `<p class="bestline">Best: <strong>${w.weight_kg} kg × ${w.reps}</strong> · Most reps: <strong>${r.reps} @ ${r.weight_kg} kg</strong></p>`;
+}
+function noteLine(last) {
+  return last && last.note ? `<p class="noteline">📝 ${esc(last.note)}</p>` : "";
 }
 
 /* ---- in-session exercise search ---- */
@@ -577,20 +645,20 @@ async function sessionPick(exerciseId) {
     }),
     api(`/exercises/${exerciseId}`),
   ]);
-  S.se = {
-    id: r.session_exercise_id, exercise: ex,
-    target_sets: targetSets, target_reps: targetReps,
-    sets: [], suggested: r.suggested_weight,
-    bodyweight: r.bodyweight, last: r.last, favorite: r.favorite,
-  };
+  wuOn = false; tfOn = false;
+  S.se = makeSe({
+    exercise: ex, target_sets: targetSets, target_reps: targetReps,
+    suggested_weight: r.suggested_weight, bodyweight: r.bodyweight,
+    last: r.last, best: r.best, favorite: r.favorite,
+  }, r.session_exercise_id);
+  S.sup = null;
   S.suggestion = null;
   renderSession();
 }
 
 async function toggleFavorite() {
-  const target = S.se || S.suggestion;
-  const exId = S.se ? S.se.exercise.id : S.suggestion.exercise.id;
-  const r = await api("/favorites/toggle", { body: { profile_id: S.profile.id, exercise_id: exId } });
+  const target = S.sup ? S.sup.items[S.sup.turn] : (S.se || S.suggestion);
+  const r = await api("/favorites/toggle", { body: { profile_id: S.profile.id, exercise_id: target.exercise.id } });
   target.favorite = r.favorite;
   renderSession();
 }
@@ -608,22 +676,43 @@ async function skip(reason) {
   renderSession();
 }
 
-async function acceptSuggestion() {
-  const sg = S.suggestion;
+function makeSe(src, seId) {
+  return {
+    id: seId, exercise: src.exercise,
+    target_sets: src.target_sets, target_reps: src.target_reps,
+    sets: [], suggested: src.suggested_weight,
+    bodyweight: src.bodyweight, last: src.last, best: src.best,
+    favorite: src.favorite, note: (src.last && src.last.note) || "",
+    lastPr: null,
+  };
+}
+
+let wuOn = false, tfOn = false;  // warm-up / to-failure toggles for the next set
+
+async function acceptOne(src) {
   const r = await api(`/sessions/${S.session.id}/accept`, {
     body: {
-      exercise_id: sg.exercise.id,
-      template_item_id: sg.template_item_id || null,
-      retry_se_id: sg.retry_se_id || null,
-      target_sets: sg.target_sets, target_reps: sg.target_reps,
+      exercise_id: src.exercise.id,
+      template_item_id: src.template_item_id || null,
+      retry_se_id: src.retry_se_id || null,
+      target_sets: src.target_sets, target_reps: src.target_reps,
     },
   });
-  S.se = {
-    id: r.session_exercise_id, exercise: sg.exercise,
-    target_sets: sg.target_sets, target_reps: sg.target_reps,
-    sets: [], suggested: sg.suggested_weight,
-    bodyweight: sg.bodyweight, last: sg.last, favorite: sg.favorite,
-  };
+  return makeSe(src, r.session_exercise_id);
+}
+
+async function acceptSuggestion() {
+  const sg = S.suggestion;
+  wuOn = false; tfOn = false;
+  if (sg.superset_next) {
+    const a = await acceptOne(sg);
+    const b = await acceptOne(sg.superset_next);
+    S.sup = { items: [a, b], turn: 0 };
+    S.se = null;
+  } else {
+    S.se = await acceptOne(sg);
+    S.sup = null;
+  }
   S.suggestion = null;
   renderSession();
 }
@@ -637,14 +726,74 @@ function bump(id, d) {
   el.value = Math.max(0, Math.round((parseFloat(el.value || 0) + d) * 10) / 10);
 }
 
+function setRowHtml(s, i, ab) {
+  return `<div class="setrow">
+    <span class="row"><span class="n">${i + 1}</span>${ab ? `<span class="ab ${ab}">${ab.toUpperCase()}</span>` : ""}</span>
+    <span><strong>${s.weight_kg} kg × ${s.reps}</strong>${s.is_warmup ? '<span class="mark w">W</span>' : ""}${s.to_failure ? '<span class="mark f">F</span>' : ""}${s.pr ? '<span class="mark pr">🏆</span>' : ""}${s.queued ? '<span class="mark q">⏳</span>' : ""}</span>
+  </div>`;
+}
+
+function prBanner(se) {
+  if (se.lastPr === "weight") return `<div class="pr-banner">🏆 New weight PR!</div>`;
+  if (se.lastPr === "reps") return `<div class="pr-banner">🏆 New rep PR at this weight!</div>`;
+  return "";
+}
+
+function hintFor(se) {
+  return se.bodyweight
+    ? `<div class="hint">${eqIcon("body only")} Bodyweight exercise — log added weight (0 if none).${bestLine(se.best)}</div>`
+    : se.suggested != null
+      ? `<div class="hint">Suggested: <strong>${se.suggested} kg</strong>${se.last && se.last.progressed ? " — you hit all your targets last time, moving up 💪" : se.last ? " (same as last time)" : ""}${bestLine(se.best)}</div>`
+      : `<div class="hint">First time on this exercise — pick a comfortable weight; next time it's remembered.</div>`;
+}
+
+let keepW = null, keepR = null;
+function toggleFlag(which) {
+  keepW = document.getElementById("w")?.value ?? null;
+  keepR = document.getElementById("r")?.value ?? null;
+  if (which === "wu") wuOn = !wuOn; else tfOn = !tfOn;
+  renderSession();
+}
+
+function flagChips() {
+  return `<div style="margin-bottom:10px">
+    <button class="chip mini ${wuOn ? "sel" : ""}" onclick="toggleFlag('wu')">Warm-up</button>
+    <button class="chip mini ${tfOn ? "sel" : ""}" onclick="toggleFlag('tf')">To failure</button>
+  </div>`;
+}
+
+function loggerControls(se, logFn) {
+  let prefill = se.sets.length ? se.sets[se.sets.length - 1].weight_kg : (se.suggested ?? (se.bodyweight ? 0 : ""));
+  let reps = se.target_reps;
+  if (keepW !== null) { prefill = keepW; keepW = null; }
+  if (keepR !== null) { reps = keepR; keepR = null; }
+  return `
+      ${flagChips()}
+      <div class="logbar">
+        <div>
+          <div class="stepper">
+            <button onclick="bump('w', -weightStep())">−</button>
+            <input type="number" id="w" step="0.5" value="${prefill}">
+            <button onclick="bump('w', weightStep())">+</button>
+          </div>
+          <div class="steplabel">kg</div>
+        </div>
+        <div>
+          <div class="stepper">
+            <button onclick="bump('r', -1)">−</button>
+            <input type="number" id="r" value="${reps}">
+            <button onclick="bump('r', 1)">+</button>
+          </div>
+          <div class="steplabel">reps</div>
+        </div>
+      </div>
+      <button class="primary" style="margin:14px 0 0" onclick="${logFn}()">Log set ${se.sets.length + 1}${wuOn ? " (warm-up)" : ""}</button>`;
+}
+
 function renderLogging() {
   const se = S.se, ex = se.exercise;
-  const suggestedNote = se.bodyweight
-    ? `<div class="hint">${eqIcon("body only")} Bodyweight exercise — log added weight (0 if none).</div>`
-    : se.suggested != null
-      ? `<div class="hint">Suggested: <strong>${se.suggested} kg</strong>${se.last && se.last.progressed ? " — you hit all your targets last time, moving up 💪" : se.last ? " (same as last time)" : ""}</div>`
-      : `<div class="hint">First time on this exercise — pick a comfortable weight; next time it's remembered.</div>`;
   render(`
+    ${prBanner(se)}
     <div class="card">
       <div class="exname spread" style="font-size:21px;margin-top:0">${esc(ex.name)}
         <span class="star" onclick="toggleFavorite()">${se.favorite ? "★" : "☆"}</span>
@@ -653,61 +802,134 @@ function renderLogging() {
       ${ex.images.length ? `<details><summary>Show demo</summary>
         <div class="demo" style="margin-top:8px"><img id="demo-img" src="${ex.images[0]}" alt="demo"></div></details>` : ""}
     </div>
-    ${suggestedNote}
+    ${hintFor(se)}
     <div class="card">
-      <div id="sets-done">${se.sets.map((s, i) => `
-        <div class="setrow"><span class="row"><span class="n">${i + 1}</span></span>
-        <strong>${s.weight_kg} kg × ${s.reps}</strong></div>`).join("")}</div>
-      <div class="logbar">
-        <div>
-          <div class="stepper">
-            <button onclick="bump('w', -weightStep())">−</button>
-            <input type="number" id="w" step="0.5" value="${se.sets.length ? se.sets[se.sets.length - 1].weight_kg : (se.suggested ?? (se.bodyweight ? 0 : ""))}">
-            <button onclick="bump('w', weightStep())">+</button>
-          </div>
-          <div class="steplabel">kg</div>
-        </div>
-        <div>
-          <div class="stepper">
-            <button onclick="bump('r', -1)">−</button>
-            <input type="number" id="r" value="${se.target_reps}">
-            <button onclick="bump('r', 1)">+</button>
-          </div>
-          <div class="steplabel">reps</div>
-        </div>
-      </div>
-      <button class="primary" style="margin:14px 0 0" onclick="logSet()">Log set ${se.sets.length + 1}</button>
+      <div id="sets-done">${se.sets.map((s, i) => setRowHtml(s, i)).join("")}</div>
+      ${loggerControls(se, "logSet")}
     </div>
+    <input type="text" id="exnote" placeholder="Note for next time (e.g. seat position 4)"
+      value="${esc(se.note)}" oninput="S.se.note=this.value">
     <button onclick="finishExercise()" style="text-align:center">Done — next exercise →</button>`);
   startDemo(ex.images);
 }
 
-async function logSet() {
+/* log one set to a given exercise; queues locally when offline */
+async function logSetTo(se) {
   const w = parseFloat(document.getElementById("w").value);
   const reps = parseInt(document.getElementById("r").value, 10);
-  if (isNaN(w) || isNaN(reps) || reps <= 0) return;
-  await api(`/session_exercises/${S.se.id}/sets`, { body: { weight_kg: w, reps } });
-  S.se.sets.push({ weight_kg: w, reps });
-  renderLogging();
+  if (isNaN(w) || isNaN(reps) || reps <= 0) return false;
+  const body = { weight_kg: w, reps, is_warmup: wuOn, to_failure: tfOn };
+  const entry = { ...body };
+  se.lastPr = null;
+  try {
+    const r = await api(`/session_exercises/${se.id}/sets`, { body });
+    entry.pr = r.pr_weight || r.pr_reps;
+    se.lastPr = r.pr_weight ? "weight" : (r.pr_reps ? "reps" : null);
+  } catch (e) {
+    if (!e.network) throw e;
+    const q = setQueue(); q.push({ seId: se.id, body }); saveSetQueue(q);
+    entry.queued = true;
+  }
+  se.sets.push(entry);
+  tfOn = false;
+  return true;
+}
+
+async function logSet() { if (await logSetTo(S.se)) renderLogging(); }
+
+async function saveExerciseNote(se) {
+  const note = (se.note || "").trim();
+  if (!note) return;
+  try { await api(`/session_exercises/${se.id}/note`, { method: "PUT", body: { note } }); } catch {}
 }
 
 async function finishExercise() {
   if (S.se.sets.length === 0 && !confirm("No sets logged — mark as skipped?")) return;
-  if (S.se.sets.length > 0) S.session.done++;
+  if (setQueue().length && !(await flushSetQueue())) {
+    alert("You're offline — sets are queued locally. Reconnect to move on.");
+    return;
+  }
+  await saveExerciseNote(S.se);
+  if (S.se.sets.some(s => !s.is_warmup)) S.session.done++;
   const r = await api(`/session_exercises/${S.se.id}/finish`, { method: "POST" });
   S.se = null;
   S.suggestion = r.suggestion;
   renderSession();
 }
 
+/* ---- superset logging ---- */
+
+function renderSupersetLogging() {
+  const sup = S.sup;
+  const cur = sup.items[sup.turn];
+  const ex = cur.exercise;
+  render(`
+    ${prBanner(sup.items[1 - sup.turn]) || prBanner(cur)}
+    <div class="card">
+      <div class="sup-row"><span class="eqicon" style="color:var(--accent)">${ICONS.link}</span><strong>Superset</strong></div>
+      ${sup.items.map((it, i) => `
+        <div class="sup-row ${i === sup.turn ? "" : "off"}">
+          <span class="ab ${i === 0 ? "a" : "b"}">${i === 0 ? "A" : "B"}</span>
+          <span class="grow">${esc(it.exercise.name)}</span>
+          ${i === sup.turn ? `<span class="star" onclick="toggleFavorite()">${it.favorite ? "★" : "☆"}</span>` : ""}
+        </div>`).join("")}
+      <div style="margin-top:6px">${eqBadge(ex.equipment)}<span class="badge">Target ${cur.target_sets} × ${cur.target_reps}</span></div>
+      ${ex.images.length ? `<details><summary>Show demo (${esc(ex.name)})</summary>
+        <div class="demo" style="margin-top:8px"><img id="demo-img" src="${ex.images[0]}" alt="demo"></div></details>` : ""}
+    </div>
+    ${hintFor(cur)}
+    <div class="card">
+      ${sup.items.map((it, i) =>
+        it.sets.map((s, j) => setRowHtml(s, j, i === 0 ? "a" : "b")).join("")).join("")}
+      ${loggerControls(cur, "logSupersetSet")}
+    </div>
+    <button onclick="finishSuperset()" style="text-align:center">Done with both — next →</button>`);
+  startDemo(ex.images);
+}
+
+async function logSupersetSet() {
+  if (await logSetTo(S.sup.items[S.sup.turn])) {
+    S.sup.items[1 - S.sup.turn].lastPr = null;
+    S.sup.turn = 1 - S.sup.turn;
+    renderSupersetLogging();
+  }
+}
+
+async function finishSuperset() {
+  const total = S.sup.items[0].sets.length + S.sup.items[1].sets.length;
+  if (total === 0 && !confirm("No sets logged — mark both as skipped?")) return;
+  if (setQueue().length && !(await flushSetQueue())) {
+    alert("You're offline — sets are queued locally. Reconnect to move on.");
+    return;
+  }
+  let last = null;
+  for (const it of S.sup.items) {
+    await saveExerciseNote(it);
+    if (it.sets.some(s => !s.is_warmup)) S.session.done++;
+    last = await api(`/session_exercises/${it.id}/finish`, { method: "POST" });
+  }
+  S.sup = null;
+  S.suggestion = last.suggestion;
+  renderSession();
+}
+
 async function finishSession() {
-  if (S.se && S.se.sets.length > 0) {
-    await api(`/session_exercises/${S.se.id}/finish`, { method: "POST" });
-    S.session.done++;
+  await flushSetQueue().catch(() => {});
+  const open = S.sup ? S.sup.items : (S.se ? [S.se] : []);
+  for (const it of open) {
+    if (it.sets.length > 0) {
+      await saveExerciseNote(it);
+      await api(`/session_exercises/${it.id}/finish`, { method: "POST" });
+      if (it.sets.some(s => !s.is_warmup)) S.session.done++;
+    }
+  }
+  const noteEl = document.getElementById("sess-note");
+  if (noteEl && noteEl.value.trim()) {
+    try { await api(`/sessions/${S.session.id}/note`, { method: "PUT", body: { note: noteEl.value } }); } catch {}
   }
   await api(`/sessions/${S.session.id}/finish`, { method: "POST" });
   localStorage.removeItem("activeSession");
-  S.session = null; S.se = null; S.suggestion = null;
+  S.session = null; S.se = null; S.sup = null; S.suggestion = null;
   go("history");
 }
 
@@ -727,14 +949,99 @@ async function renderHistory() {
           <span class="dim">${done.length} exercises ›</span>
         </div>
         <div hidden style="margin-top:8px">
+          ${s.note ? `<p class="noteline" style="margin:0 0 8px">📝 ${esc(s.note)}</p>` : ""}
           ${s.exercises.map(e => e.status === "done"
-            ? `<div class="setrow"><span>${esc(e.name)}</span><strong>${e.sets.map(x => `${x.weight_kg}×${x.reps}`).join(", ")}</strong></div>`
+            ? `<div class="setrow" style="cursor:pointer" onclick="go('exercise-detail','${e.exercise_id}')">
+                 <span>${esc(e.name)}${e.note ? ` <span class="dim">📝</span>` : ""}</span>
+                 <strong>${e.sets.map(x => `${x.is_warmup ? "w·" : ""}${x.weight_kg}×${x.reps}`).join(", ")}</strong></div>`
             : `<div class="setrow"><span class="muted-strike">${esc(e.name)}</span><span class="dim">skipped</span></div>`).join("")}
-          <button class="danger-ghost small" style="margin-top:12px" onclick="deleteSession(${s.id})">Delete session</button>
+          <div class="row" style="margin-top:12px">
+            ${done.length ? `<button class="small" onclick="saveAsWorkout(${s.id})">Save as workout</button>` : ""}
+            <button class="danger-ghost small" onclick="deleteSession(${s.id})">Delete</button>
+          </div>
         </div>
       </div>`;
     }).join("")}
     <button class="ghost" onclick="go('home')">Back</button>`);
+}
+
+async function saveAsWorkout(sessionId) {
+  const name = prompt("Name for this workout:");
+  if (!name || !name.trim()) return;
+  await api(`/sessions/${sessionId}/save_template`, { body: { name: name.trim() } });
+  alert(`Saved — “${name.trim()}” is now under My workouts.`);
+}
+
+/* ------------------------------------------------ progress */
+
+async function renderProgress() {
+  const items = await api(`/progress?profile_id=${S.profile.id}`);
+  render(`
+    ${items.length === 0 ? `<p class="dim topnote">Log some sessions and your per-exercise progress shows up here.</p>` : `<p class="dim topnote">Tap an exercise for its chart and bests.</p>`}
+    ${items.map(it => `
+      <div class="list-item">
+        <div class="spread" onclick="go('exercise-detail','${it.exercise_id}')">
+          <span>
+            <strong>${esc(it.name)}</strong><br>
+            <span style="display:inline-block;margin-top:6px">${partBadge(it.bodyPart)}${eqBadge(it.equipment)}</span>
+          </span>
+          <span class="dim" style="text-align:right;flex:none">${it.top_weight} kg top<br>${it.sessions} session${it.sessions === 1 ? "" : "s"} ›</span>
+        </div>
+      </div>`).join("")}
+    <button class="ghost" onclick="go('home')">Back</button>`);
+}
+
+function chartSVG(points) {
+  // points: chronological [{label, y}]
+  if (points.length < 2) return `<p class="dim">Two or more sessions needed for a chart.</p>`;
+  const W = 340, H = 150, L = 34, R = 10, T = 14, B = 24;
+  const ys = points.map(p => p.y);
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  if (lo === hi) { lo -= 2.5; hi += 2.5; }
+  const pad = (hi - lo) * 0.12;
+  lo -= pad; hi += pad;
+  const px = (i) => L + (i / (points.length - 1)) * (W - L - R);
+  const py = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  const pts = points.map((p, i) => `${px(i).toFixed(1)},${py(p.y).toFixed(1)}`).join(" ");
+  return `<div class="chartbox"><svg viewBox="0 0 ${W} ${H}">
+    <line x1="${L}" y1="${py(hi - pad)}" x2="${W - R}" y2="${py(hi - pad)}" stroke="#243040" stroke-dasharray="3 4"/>
+    <line x1="${L}" y1="${py(lo + pad)}" x2="${W - R}" y2="${py(lo + pad)}" stroke="#243040" stroke-dasharray="3 4"/>
+    <text x="2" y="${py(hi - pad) + 4}" fill="#8fa1b3" font-size="10">${Math.round((hi - pad) * 10) / 10}</text>
+    <text x="2" y="${py(lo + pad) + 4}" fill="#8fa1b3" font-size="10">${Math.round((lo + pad) * 10) / 10}</text>
+    <polyline points="${pts}" fill="none" stroke="#3ddc84" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>
+    ${points.map((p, i) => `<circle cx="${px(i)}" cy="${py(p.y)}" r="3.2" fill="#0b0f14" stroke="#3ddc84" stroke-width="2"/>`).join("")}
+    <text x="${L}" y="${H - 6}" fill="#8fa1b3" font-size="10">${points[0].label}</text>
+    <text x="${W - R}" y="${H - 6}" fill="#8fa1b3" font-size="10" text-anchor="end">${points[points.length - 1].label}</text>
+  </svg></div>`;
+}
+
+async function renderExerciseDetail(exerciseId) {
+  const [ex, hist] = await Promise.all([
+    api(`/exercises/${exerciseId}`),
+    api(`/history/${exerciseId}?profile_id=${S.profile.id}`),
+  ]);
+  const entries = hist.slice().reverse()  // chronological
+    .map(h => ({ ...h, work: h.sets.filter(s => !s.is_warmup) }))
+    .filter(h => h.work.length);
+  const points = entries.map(h => ({ label: h.date.slice(5), y: Math.max(...h.work.map(s => s.weight_kg)) }));
+  const all = entries.flatMap(h => h.work);
+  let best = "";
+  if (all.length) {
+    const tw = all.reduce((a, b) => (b.weight_kg > a.weight_kg || (b.weight_kg === a.weight_kg && b.reps > a.reps)) ? b : a);
+    const tr = all.reduce((a, b) => (b.reps > a.reps || (b.reps === a.reps && b.weight_kg > a.weight_kg)) ? b : a);
+    best = bestLine({ top_weight: { weight_kg: tw.weight_kg, reps: tw.reps }, top_reps: { reps: tr.reps, weight_kg: tr.weight_kg } });
+  }
+  render(`
+    <div class="card">
+      <div>${partBadge(ex.bodyPart)}${eqBadge(ex.equipment)}</div>
+      <div class="exname" style="font-size:21px">${esc(ex.name)}</div>
+      ${chartSVG(points)}
+      ${best}
+    </div>
+    ${hist.map(h => `
+      <div class="setrow"><span class="dim">${h.date}</span>
+        <strong>${h.sets.map(x => `${x.is_warmup ? "w·" : ""}${x.weight_kg}×${x.reps}`).join(", ")}</strong></div>`).join("")}
+    <button class="ghost" style="margin-top:14px" onclick="go('progress')">Back</button>`);
 }
 
 async function deleteSession(id) {
@@ -745,4 +1052,6 @@ async function deleteSession(id) {
 
 /* ------------------------------------------------ boot */
 
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("/sw.js").catch(() => {});
+flushSetQueue().catch(() => {});
 go(S.profile ? "home" : "profile");
