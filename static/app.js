@@ -484,7 +484,8 @@ async function renderSession() {
         <p style="font-size:19px;font-weight:800">${sg && sg.reason ? esc(sg.reason) : "Workout complete!"}</p>
         <p class="dim">${S.session.done} exercise${S.session.done === 1 ? "" : "s"} done</p>
       </div>
-      <button class="primary" onclick="finishSession()">Finish &amp; save session</button>`);
+      <button class="primary" onclick="finishSession()">Finish &amp; save session</button>
+      <button class="ghost" onclick="renderSessionSearch()">🔍 Add one more — search exercises</button>`);
     return;
   }
   const ex = sg.exercise;
@@ -510,8 +511,80 @@ async function renderSession() {
       <button onclick="skip('same')">Skip<span class="dim" style="display:block;font-size:12px;font-weight:500">same body part</span></button>
       <button onclick="skip('different')">Skip<span class="dim" style="display:block;font-size:12px;font-weight:500">${S.session.mode === "template" ? "this exercise" : "different body part"}</span></button>
     </div>
-    <button class="warn" style="text-align:center" onclick="skip('later')"><span class="eqicon" style="vertical-align:-3px;margin-right:6px">${ICONS.clock}</span>Equipment busy — try again later</button>`);
+    <button class="warn" style="text-align:center" onclick="skip('later')"><span class="eqicon" style="vertical-align:-3px;margin-right:6px">${ICONS.clock}</span>Equipment busy — try again later</button>
+    <button class="ghost" onclick="renderSessionSearch()">🔍 ${S.session.mode === "template" ? "Swap in a different exercise" : "Search for an exercise instead"}</button>`);
   startDemo(ex.images);
+}
+
+/* ---- in-session exercise search ---- */
+
+let sessPartFilter = "";
+let sessSearchTimer = null;
+
+function renderSessionSearch() {
+  sessionHeader();
+  sessPartFilter = S.suggestion && !S.suggestion.done
+    ? (S.suggestion.body_part || S.suggestion.exercise.bodyPart || "") : "";
+  render(`
+    <input type="search" id="sess-search" placeholder="Search exercises…" oninput="sessionSearchExercises()">
+    <div id="sess-part-filters">
+      ${["", ...S.meta.bodyParts].map(p => `
+        <button class="chip ${p === sessPartFilter ? "sel" : ""}" data-sp="${p}"
+          onclick="sessPartFilter='${p}';refreshSessChips();sessionSearchExercises()">${p || "All"}</button>`).join("")}
+    </div>
+    <div id="sess-results"></div>
+    <button class="ghost" onclick="renderSession()">← Back to session</button>`);
+  sessionSearchExercises();
+  document.getElementById("sess-search").focus();
+}
+
+function refreshSessChips() {
+  document.querySelectorAll("[data-sp]").forEach(b =>
+    b.classList.toggle("sel", b.dataset.sp === sessPartFilter));
+}
+
+function sessionSearchExercises() {
+  clearTimeout(sessSearchTimer);
+  sessSearchTimer = setTimeout(async () => {
+    const q = document.getElementById("sess-search")?.value || "";
+    const res = await api(`/exercises?q=${encodeURIComponent(q)}&body_part=${encodeURIComponent(sessPartFilter)}&limit=25`);
+    const el = document.getElementById("sess-results");
+    if (!el) return;
+    el.innerHTML = res.map(ex => `
+      <div class="list-item">
+        <div class="spread">
+          <span>
+            <strong>${esc(ex.name)}</strong><br>
+            <span style="display:inline-block;margin-top:6px">${partBadge(ex.bodyPart)}${eqBadge(ex.equipment)}</span>
+          </span>
+          <button class="small primary" onclick='sessionPick(${JSON.stringify(ex.id)})'>Do this</button>
+        </div>
+      </div>`).join("") || `<p class="dim">No matches.</p>`;
+  }, 250);
+}
+
+async function sessionPick(exerciseId) {
+  const sg = S.suggestion;
+  // A searched pick claims the current template item (a user-chosen swap),
+  // unless the on-screen suggestion was a deferred retry — that one stays owed.
+  const itemId = sg && !sg.done && !sg.retry ? (sg.template_item_id || null) : null;
+  const targetSets = sg && !sg.done ? sg.target_sets : 3;
+  const targetReps = sg && !sg.done ? sg.target_reps : 8;
+  const [r, ex] = await Promise.all([
+    api(`/sessions/${S.session.id}/accept`, {
+      body: { exercise_id: exerciseId, template_item_id: itemId, retry_se_id: null,
+              target_sets: targetSets, target_reps: targetReps },
+    }),
+    api(`/exercises/${exerciseId}`),
+  ]);
+  S.se = {
+    id: r.session_exercise_id, exercise: ex,
+    target_sets: targetSets, target_reps: targetReps,
+    sets: [], suggested: r.suggested_weight,
+    bodyweight: r.bodyweight, last: r.last, favorite: r.favorite,
+  };
+  S.suggestion = null;
+  renderSession();
 }
 
 async function toggleFavorite() {

@@ -755,13 +755,17 @@ def accept_exercise(session_id: int, body: AcceptIn):
         raise HTTPException(404, "exercise not found")
     with db() as conn:
         sess = session_row(conn, session_id)
+        extra = {
+            "favorite": is_favorite(conn, sess["profile_id"], body.exercise_id),
+            **suggest_weight(conn, sess["profile_id"], body.exercise_id),
+        }
         if body.retry_se_id:
             conn.execute(
                 "UPDATE session_exercises SET status='active', target_sets=?, target_reps=?"
                 " WHERE id=? AND session_id=?",
                 (body.target_sets, body.target_reps, body.retry_se_id, session_id),
             )
-            return {"session_exercise_id": body.retry_se_id}
+            return {"session_exercise_id": body.retry_se_id, **extra}
         pos = max_position(conn, session_id) + 1
         ex = EXERCISES[body.exercise_id]
         cur = conn.execute(
@@ -770,7 +774,7 @@ def accept_exercise(session_id: int, body: AcceptIn):
             (session_id, body.exercise_id, pos, body.target_sets, body.target_reps,
              "active", ex["bodyPart"], body.template_item_id),
         )
-        return {"session_exercise_id": cur.lastrowid}
+        return {"session_exercise_id": cur.lastrowid, **extra}
 
 
 @app.post("/api/session_exercises/{se_id}/sets")
