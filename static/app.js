@@ -657,10 +657,17 @@ async function renderHistory() {
           ${s.exercises.map(e => e.status === "done"
             ? `<div class="setrow"><span>${esc(e.name)}</span><strong>${e.sets.map(x => `${x.weight_kg}×${x.reps}`).join(", ")}</strong></div>`
             : `<div class="setrow"><span class="muted-strike">${esc(e.name)}</span><span class="dim">skipped</span></div>`).join("")}
+          <button class="danger-ghost small" style="margin-top:12px" onclick="deleteSession(${s.id})">Delete session</button>
         </div>
       </div>`;
     }).join("")}
     <button class="ghost" onclick="go('home')">Back</button>`);
+}
+
+async function deleteSession(id) {
+  if (!confirm("Delete this session and all its logged sets?")) return;
+  await api(`/sessions/${id}`, { method: "DELETE" });
+  renderHistory();
 }
 
 /* ------------------------------------------------ boot */

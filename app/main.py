@@ -824,6 +824,22 @@ def finish_session(session_id: int):
             " WHERE session_id=? AND status='active'",
             (session_id,),
         )
+        # A session with nothing completed isn't worth keeping.
+        done = conn.execute(
+            "SELECT COUNT(*) c FROM session_exercises WHERE session_id=? AND status='done'",
+            (session_id,),
+        ).fetchone()["c"]
+        if done == 0:
+            conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
+            return {"ok": True, "deleted": True}
+    return {"ok": True, "deleted": False}
+
+
+@app.delete("/api/sessions/{session_id}")
+def delete_session(session_id: int):
+    with db() as conn:
+        session_row(conn, session_id)
+        conn.execute("DELETE FROM sessions WHERE id=?", (session_id,))
     return {"ok": True}
 
 # ----- history
